@@ -4,6 +4,7 @@ A naive demo aims to prove the ablity of a C++ graphic programer mastering front
 
 ![](https://github.com/xu-xionglong/MyDemo/blob/master/ezgif-4-2731c3a75f68.gif)
 
+
 ##Dependency
 
 [rn-fetch-blob](https://github.com/joltup/rn-fetch-blob)
@@ -23,6 +24,7 @@ A naive demo aims to prove the ablity of a C++ graphic programer mastering front
 [react-navigation](https://github.com/react-navigation/react-navigation)
 
 [WebARonARKit](https://github.com/google-ar/WebARonARKit)
+
 
 ##Device Limitation
 
