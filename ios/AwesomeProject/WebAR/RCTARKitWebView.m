@@ -1,0 +1,974 @@
+/*
+ * Copyright 2017 Google Inc. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#import "Renderer.h"
+#import "RCTARKitWebView.h"
+
+#import <sys/utsname.h>
+
+#define FBOX(x) [NSNumber numberWithFloat:x]
+
+NSString *deviceName() {
+    struct utsname systemInfo;
+    uname(&systemInfo);
+    return [NSString stringWithCString:systemInfo.machine
+                              encoding:NSUTF8StringEncoding];
+}
+
+// TODO: Should this be a percentage?
+#define NOTCH_TAB_WIDTH 83
+#define NOTCH_HEIGHT 30
+#define NOTCH_WIDTH 209
+
+#define URL_SAFE_AREA_VERTICAL 8
+#define URL_SAFE_AREA_HORIZONTAL 16
+
+#define URL_BUTTON_PADDING 16
+
+#define URL_BUTTON_WIDTH_PORTRAIT_X 64
+#define URL_BUTTON_HEIGHT_PORTRAIT_X 30
+
+#define URL_BUTTON_WIDTH_PORTRAIT 44
+#define URL_BUTTON_HEIGHT_PORTRAIT 44
+
+#define URL_BUTTON_WIDTH_LANDSCAPE 44
+#define URL_BUTTON_HEIGHT_LANDSCAPE 44
+
+#define URL_TEXTFIELD_HEIGHT_EXPANDED 44
+#define URL_TEXTFIELD_HEIGHT_MINIFIED 14
+
+#define URL_TEXTFIELD_HEIGHT 44
+#define PROGRESSVIEW_HEIGHT 2
+
+// Helper functions to determine the iOS version
+#define SYSTEM_VERSION_EQUAL_TO(v)                  ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedSame)
+#define SYSTEM_VERSION_GREATER_THAN(v)              ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedDescending)
+#define SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(v)  ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] != NSOrderedAscending)
+#define SYSTEM_VERSION_LESS_THAN(v)                 ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] == NSOrderedAscending)
+#define SYSTEM_VERSION_LESS_THAN_OR_EQUAL_TO(v)     ([[[UIDevice currentDevice] systemVersion] compare:v options:NSNumericSearch] != NSOrderedDescending)
+
+// Set this value to true or false to enable the passing of the camera
+// frame from the native side to the JS side in each frame.
+const bool SEND_CAMERA_FRAME_TO_JS = false;
+// Use these values to control the camera frame quality
+const float CAMERA_FRAME_SCALE_FACTOR = 0.4;
+const float CAMERA_FRAME_JPEG_COMPRESSION_FACTOR = 0.5;
+
+@interface RCTARKitWebView ()<MTKViewDelegate, ARSessionDelegate>
+
+@property(nonatomic, strong) ARSession *session;
+@property(nonatomic, strong) Renderer *renderer;
+
+@end
+
+@interface MTKView ()<RenderDestinationProvider>
+
+@end
+
+@implementation RCTARKitWebView
+
+- (void)showAlertDialog:(NSString *)message
+      completionHandler:(void (^)(void))completionHandler {
+    UIAlertController *alertController =
+    [UIAlertController alertControllerWithTitle:message
+                                        message:nil
+                                 preferredStyle:UIAlertControllerStyleAlert];
+    [alertController
+     addAction:[UIAlertAction actionWithTitle:@"OK"
+                                        style:UIAlertActionStyleCancel
+                                      handler:^(UIAlertAction *action) {
+                                          if (completionHandler) {
+                                              completionHandler();
+                                          }
+                                      }]];
+    /*[self presentViewController:alertController
+                       animated:YES
+                     completion:^{
+                     }];*/
+}
+
+- (void)setWKWebViewScrollEnabled:(BOOL)enabled {
+    wkWebView.scrollView.scrollEnabled = enabled;
+    wkWebView.scrollView.panGestureRecognizer.enabled = enabled;
+    wkWebView.scrollView.bounces = enabled;
+}
+
+- (bool)loadURLInWKWebView:(NSString *)urlString {
+    bool result = true;
+    // Try to create a url with the provided string
+    NSURL *nsurl = [NSURL URLWithString:urlString];
+    bool fileScheme = nsurl && nsurl.scheme &&
+    [[nsurl.scheme lowercaseString] isEqualToString:@"file"];
+    // Quick hack: If the url string is not a proper URL, try to add http to it to
+    // see if it is an actual URL
+    if (!nsurl || !nsurl.scheme || !nsurl.host) {
+        NSString *urlStringWithHTTP =
+        [NSString stringWithFormat:@"http://%@", urlString];
+        nsurl = [NSURL URLWithString:urlStringWithHTTP];
+    }
+    // If the string did not represent a url or is a filescheme url, the way the
+    // page is loaded is different
+    if (!nsurl || !nsurl.scheme || !nsurl.host || fileScheme) {
+        NSString *nsurlPath = urlString;
+        NSString *pathExtension = @"html";
+        // If the file:// scheme was provided, remove the scheme and trim the
+        // extension if included.
+        if (fileScheme) {
+            nsurlPath = [NSString stringWithFormat:@"%@%@", nsurl.host, nsurl.path];
+            if ([[nsurl.pathExtension lowercaseString]
+                 isEqualToString:pathExtension]) {
+                NSRange range =
+                [[nsurlPath lowercaseString] rangeOfString:@".html"
+                                                   options:NSBackwardsSearch];
+                nsurlPath =
+                [nsurlPath stringByReplacingCharactersInRange:range withString:@""];
+            }
+        } else {
+            // If the file:// was not provided, trim the extension if included.
+            NSRange range =
+            [[nsurlPath lowercaseString] rangeOfString:@".html"
+                                               options:NSBackwardsSearch];
+            if (range.location != NSNotFound &&
+                range.location == nsurlPath.length - 5) {
+                nsurlPath =
+                [nsurlPath stringByReplacingCharactersInRange:range withString:@""];
+            }
+        }
+        //        NSLog(@"nsurlPath = %@", nsurlPath);
+        // Is the URL string a path to a file?
+        NSString *path =
+        [[NSBundle mainBundle] pathForResource:nsurlPath ofType:pathExtension];
+        // If the path is incorrect, it could be because is a path to a folder
+        // instead of a file
+        if (!path) {
+            path = [[NSBundle mainBundle] pathForResource:nsurlPath ofType:nil];
+        }
+        bool isDirectory = false;
+        //        NSLog(@"Loading a file from resources with path = %@", path);
+        // Make sure that the path exists and get a flag to indicate if the path
+        // represents a directory
+        if (path &&
+            [[NSFileManager defaultManager] fileExistsAtPath:path
+                                                 isDirectory:&isDirectory]) {
+                // If the path is to a directory, add the index at the end (try to load
+                // index.html).
+                if (isDirectory) {
+                    nsurlPath = [NSString stringWithFormat:@"%@/index", nsurlPath];
+                }
+                NSURL *url = [[NSBundle mainBundle] URLForResource:nsurlPath
+                                                     withExtension:pathExtension];
+                // The final URL to the resource may fail so just in case...
+                if (!url) {
+                    result = false;
+                } else {
+                    //                NSLog(@"Loading a file from resources with url = %@",
+                    //                url.absoluteString);
+                    [self->wkWebView loadRequest:[NSURLRequest requestWithURL:url]];
+                }
+            } else {
+                result = false;
+            }
+    } else {
+        NSURLRequest *nsrequest = [NSURLRequest requestWithURL:nsurl];
+        [self->wkWebView loadRequest:nsrequest];
+    }
+    return result;
+}
+
+- (void)setSource:(NSString *)source
+{
+  if (![_source isEqualToString:source]) {
+    _source = [source copy];
+    NSURL *url = [NSURL URLWithString: source];
+    [wkWebView loadRequest:[NSURLRequest requestWithURL:url]];
+  }
+}
+
+- (void)loadURL:(NSString *)urlString {
+    if (![self loadURLInWKWebView:urlString]) {
+        [self showAlertDialog:@"The URL is not valid." completionHandler:NULL];
+    } else {
+        [self storeURLInUserDefaults:urlString];
+    }
+}
+
+- (NSString *)getURLFromUserDefaults {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    return [defaults stringForKey:@"url"];
+}
+
+- (void)storeURLInUserDefaults:(NSString *)urlString {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setObject:urlString forKey:@"url"];
+    [defaults synchronize];
+}
+
+- (void)setShowCameraFeed:(bool)show {
+    if (show && !SEND_CAMERA_FRAME_TO_JS) {
+        wkWebView.opaque = false;
+        wkWebView.backgroundColor = [UIColor clearColor];
+        wkWebView.scrollView.backgroundColor = [UIColor clearColor];
+    } else {
+        wkWebView.opaque = true;
+        wkWebView.backgroundColor = wkWebViewOriginalBackgroundColor;
+        wkWebView.scrollView.backgroundColor = wkWebViewOriginalBackgroundColor;
+    }
+    showingCameraFeed = show;
+    NSLog(@"show camera feed: %@", show ? @"YES" : @"NO");
+}
+
+- (void)deviceCheck {
+    NSString *deviceType = deviceName();
+    NSRange containiPhoneX = [deviceType rangeOfString:@"iPhone10" options:NSCaseInsensitiveSearch];
+    if (containiPhoneX.location == NSNotFound) {
+        iPhoneXDevice = false;
+
+    } else {
+        iPhoneXDevice = true;
+    }
+}
+
+- (void)layoutSubviews {
+  [super layoutSubviews];
+  [self updateInterface];
+  [_renderer drawRectResized:mtkView.bounds.size];
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame: frame];
+
+    [self deviceCheck];
+
+    near = 0.01f;
+    far = 10000.0f;
+    showingCameraFeed = false;
+
+    // By default, we draw camera frames but do not send AR data until a frame
+    // is drawn.
+    drawNextCameraFrame = false;
+    sendARData = false;
+
+    timeOfLastDrawnCameraFrame = 0;
+
+    jsAnchorIdsToObjCAnchorIds = [[NSMutableDictionary alloc] init];
+    objCAnchorIdsToJSAnchorIds = [[NSMutableDictionary alloc] init];
+    anchors = [[NSMutableDictionary alloc] init];
+
+    // Create an ARSession
+    _session = [ARSession new];
+    _session.delegate = self;
+
+    // Set the view to use the default device
+    mtkView = [[MTKView alloc] initWithFrame:self.frame device:MTLCreateSystemDefaultDevice()];
+    mtkView.delegate = self;
+    [mtkView setFrame:CGRectMake(0, 0,
+                                 self.frame.size.width,
+                                 self.frame.size.height)];
+
+    if (!mtkView.device) {
+        NSLog(@"Metal is not supported on this device");
+    }
+    [self addSubview:mtkView];
+
+    // Configure the renderer to draw to the view
+    _renderer = [[Renderer alloc] initWithSession:self.session
+                                      metalDevice:mtkView.device
+                        renderDestinationProvider:mtkView];
+    [_renderer drawRectResized:mtkView.bounds.size];
+
+    //UITapGestureRecognizer *tapGesture =
+    //[[UITapGestureRecognizer alloc] initWithTarget:self
+    //                                        action:@selector(handleTap:)];
+    //NSMutableArray *gestureRecognizers = [NSMutableArray array];
+    //[gestureRecognizers addObject:tapGesture];
+    //[gestureRecognizers addObjectsFromArray:self.gestureRecognizers];
+    //self.gestureRecognizers = gestureRecognizers;
+
+    // Clear the webview completely
+    //    NSSet *websiteDataTypes = [NSSet setWithArray:@[
+    //        WKWebsiteDataTypeDiskCache,
+    //        //WKWebsiteDataTypeOfflineWebApplicationCache,
+    //        WKWebsiteDataTypeMemoryCache,
+    //        //WKWebsiteDataTypeLocalStorage,
+    //        //WKWebsiteDataTypeCookies,
+    //        //WKWebsiteDataTypeSessionStorage,
+    //        //WKWebsiteDataTypeIndexedDBDatabases,
+    //        //WKWebsiteDataTypeWebSQLDatabases
+    //    ]];
+    NSSet *websiteDataTypes = [WKWebsiteDataStore allWebsiteDataTypes];
+    NSDate *dateFrom = [NSDate dateWithTimeIntervalSince1970:0];
+    [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:websiteDataTypes
+                                               modifiedSince:dateFrom
+                                           completionHandler:^{
+                                           }];
+    // Make sure that WebARonARKit.js is injected at the beginning of any webpage
+    // Load the WebARonARKit.js file
+    NSString *WebARonARKitJSPath =
+    [[NSBundle mainBundle] pathForResource:@"WebARonARKit" ofType:@"js"];
+    NSString *WebARonARKitJSContent =
+    [NSString stringWithContentsOfFile:WebARonARKitJSPath
+                              encoding:NSUTF8StringEncoding
+                                 error:NULL];
+    // Setup the script injection
+    WKUserScript *sendCameraFrameUserScript = [[WKUserScript alloc]
+                                              initWithSource:
+                                              [NSString stringWithFormat:
+                                               @"window.WebARonARKitSendsCameraFrames = %@;",
+                                               SEND_CAMERA_FRAME_TO_JS ? @"true" : @"false"]
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                              forMainFrameOnly:true];
+    WKUserScript *WebARonARKitJSUserScript = [[WKUserScript alloc]
+                                              initWithSource:WebARonARKitJSContent
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                              forMainFrameOnly:true];
+    WKUserContentController *userContentController =
+    [[WKUserContentController alloc] init];
+    [userContentController addScriptMessageHandler:self name:@"WebARonARKit"];
+    [userContentController addUserScript:sendCameraFrameUserScript];
+    [userContentController addUserScript:WebARonARKitJSUserScript];
+    WKWebViewConfiguration *wkWebViewConfig =
+    [[WKWebViewConfiguration alloc] init];
+    wkWebViewConfig.userContentController = userContentController;
+    // Create the WKWebView using the configuration/script injection and add it to
+    // the top of the view graph
+    wkWebView = [[WKWebView alloc] initWithFrame:self.frame
+                                   configuration:wkWebViewConfig];
+    wkWebViewOriginalBackgroundColor = [UIColor whiteColor];
+    // By default, the camera feed won't be shown until instructed otherwise
+    [self setShowCameraFeed:NO];
+
+    // Fixes the webview scalling problem on iPhoneX.
+    [wkWebView.scrollView
+       setContentInsetAdjustmentBehavior:
+       UIScrollViewContentInsetAdjustmentNever];
+
+    [wkWebView.configuration.preferences setValue:@TRUE
+                                           forKey:@"allowFileAccessFromFileURLs"];
+    [self setWKWebViewScrollEnabled:true];
+    // Needed to show alerts. Check the WKUIDelegate protocol and the
+    // runJavaScriptAlertPanelWithMessage method in this file :(
+    wkWebView.UIDelegate = self;
+    wkWebView.navigationDelegate = self;
+    [self addSubview:wkWebView];
+
+    initialPageLoadedWhenTrackingBegins = false;
+
+    [self initOrientationNotifications];
+    [self updateOrientation];
+    [self updateInterface];
+  
+    return self;
+}
+
+- (void)initOrientationNotifications {
+    // Calculate the orientation of the device
+    UIDevice *device = [UIDevice currentDevice];
+    [device beginGeneratingDeviceOrientationNotifications];
+    [[NSNotificationCenter defaultCenter]
+     addObserver:self
+     selector:@selector(deviceOrientationDidChange:)
+     name:UIDeviceOrientationDidChangeNotification
+     object:nil];
+    deviceOrientation = [device orientation];
+}
+
+- (void)dealloc {
+    [wkWebView
+    removeObserver:self
+    forKeyPath:NSStringFromSelector(@selector(estimatedProgress))];
+
+    [wkWebView setNavigationDelegate:nil];
+    [wkWebView setUIDelegate:nil];
+}
+
+#pragma mark - Orientation Change
+
+- (void)deviceOrientationDidChange:(NSNotification *)notification {
+    [self updateOrientation];
+    [self updateInterface];
+    updateWindowSize = true;
+}
+
+- (void)updateOrientation {
+    deviceOrientation = [[UIDevice currentDevice] orientation];
+    switch (deviceOrientation) {
+        case UIDeviceOrientationPortrait: {
+            interfaceOrientation = UIInterfaceOrientationPortrait;
+        } break;
+
+        case UIDeviceOrientationPortraitUpsideDown: {
+            interfaceOrientation = UIInterfaceOrientationPortraitUpsideDown;
+        } break;
+
+        case UIDeviceOrientationLandscapeLeft: {
+            interfaceOrientation = UIInterfaceOrientationLandscapeRight;
+        } break;
+
+        case UIDeviceOrientationLandscapeRight: {
+            interfaceOrientation = UIInterfaceOrientationLandscapeLeft;
+        } break;
+
+        default:
+            break;
+    }
+    [_renderer setInterfaceOrientation:interfaceOrientation];
+}
+
+- (void)updateInterface {
+  CGRect contentRect = CGRectMake(0, 0,
+                                  self.frame.size.width,
+                                  self.frame.size.height);
+  [mtkView setFrame:contentRect];
+  [wkWebView setFrame:contentRect];
+}
+
+- (void)restartSession {
+    // Remove all the cached structures.
+    [anchors removeAllObjects];
+    [jsAnchorIdsToObjCAnchorIds removeAllObjects];
+    [objCAnchorIdsToJSAnchorIds removeAllObjects];
+    ARWorldTrackingConfiguration *configuration =
+    [ARWorldTrackingConfiguration new];
+    configuration.planeDetection = ARPlaneDetectionHorizontal;
+    [_session runWithConfiguration:configuration
+                           options:ARSessionRunOptionResetTracking];
+}
+
+
+
+- (void)willMoveToWindow:(UIWindow *)newWindow
+{
+  [super willMoveToWindow:newWindow];
+  UIDevice *device = [UIDevice currentDevice];
+  if (![device isGeneratingDeviceOrientationNotifications]) {
+    [device beginGeneratingDeviceOrientationNotifications];
+  }
+  
+  [self restartSession];
+}
+
+- (void)didMoveToWindow
+{
+  [super didMoveToWindow];
+  if(!self.window) {
+    UIDevice *device = [UIDevice currentDevice];
+    if ([device isGeneratingDeviceOrientationNotifications]) {
+      [device endGeneratingDeviceOrientationNotifications];
+    }
+    
+    [_session pause];
+  }
+}
+
+- (void)handleTap:(UIGestureRecognizer *)gestureRecognize {
+    ARFrame *currentFrame = [_session currentFrame];
+
+    // Create anchor using the camera's current position
+    if (currentFrame) {
+        // Create a transform with a translation of 0.2 meters in front of the
+        // camera
+        matrix_float4x4 translation = matrix_identity_float4x4;
+        translation.columns[3].z = -0.2;
+        matrix_float4x4 transform =
+        matrix_multiply(currentFrame.camera.transform, translation);
+
+        // Add a new anchor to the session
+        ARAnchor *anchor = [[ARAnchor alloc] initWithTransform:transform];
+        [self.session addAnchor:anchor];
+    }
+}
+
+#pragma mark - MTKViewDelegate
+
+// Called whenever view changes orientation or layout is changed
+- (void)mtkView:(nonnull MTKView *)view drawableSizeWillChange:(CGSize)size {
+    [_renderer drawRectResized:view.bounds.size];
+}
+
+// Called whenever the view needs to render
+- (void)drawInMTKView:(nonnull MTKView *)view {
+  //todo
+    // Calculate the time passed since the last camera frame that was drawn.
+    CFTimeInterval currentTime = CACurrentMediaTime();
+    // If the time of the last drawn camera frame is 0, use the current time.
+    if (timeOfLastDrawnCameraFrame == 0) {
+        timeOfLastDrawnCameraFrame = currentTime;
+    }
+    CFTimeInterval timeSinceLastDrawnCameraFrame =
+    currentTime - timeOfLastDrawnCameraFrame;
+    // If the time passed since the last camera frame was drawn is over a second
+    // it means that the JS side was not ready to listen to the send AR data event
+    // and therefore, we need to force a camera frame draw and an AR data send.
+    if (timeSinceLastDrawnCameraFrame > 1) {
+        drawNextCameraFrame = true;
+    }
+    // Only if the JS side stated that the AR data was used to render the 3D
+    // scene, we can render a camera frame.
+    if (drawNextCameraFrame) {
+        if (!SEND_CAMERA_FRAME_TO_JS) {
+          [_renderer update];
+        }
+        drawNextCameraFrame = false;
+        // Now that the camera frame has been rendered, the AR data can be sent.
+        sendARData = true;
+        // Store the time when the camera frame was drawn just in case...
+        timeOfLastDrawnCameraFrame = currentTime;
+    }
+}
+
+#pragma mark - ARSessionDelegate
+
+- (void)session:(ARSession *)session didFailWithError:(NSError *)error {
+    // Present an error message to the user
+}
+
+- (void)sessionWasInterrupted:(ARSession *)session {
+    // Inform the user that the session has been interrupted, for example, by
+    // presenting an overlay
+}
+
+- (void)sessionInterruptionEnded:(ARSession *)session {
+    // Reset tracking and/or remove existing anchors if consistent tracking is
+    // required
+}
+
+- (NSString *)getPlanesString:(nonnull NSArray<ARAnchor *> *)anchors {
+    // Return nil if no planes are among the anchors
+    NSString *result = nil;
+    for (int i = 0; i < anchors.count; i++) {
+        if (![anchors[i] isKindOfClass:[ARPlaneAnchor class]]) {
+            // We only want anchors of type plane.
+            continue;
+        }
+        // Now that we know that there is at least one plane among the anchors,
+        // create the returning string.
+        if (result == nil) {
+            result = @"[";
+        }
+        ARPlaneAnchor *plane = (ARPlaneAnchor *)anchors[i];
+        matrix_float4x4 planeTransform = plane.transform;
+        const float *planeMatrix = (const float *)(&planeTransform);
+        NSString *planeStr = [NSString
+                              stringWithFormat:
+                              @"{\"modelMatrix\":[%f,%f,%f,%f,%f,%f,%f,%f,"
+                              @"%f,%f,%f,%f,%f,%f,%f,%f],"
+                              @"\"identifier\":%i,"
+                              @"\"extent\":[%f,%f],"
+                              @"\"vertices\":[%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f]}",
+                              planeMatrix[0], planeMatrix[1], planeMatrix[2], planeMatrix[3],
+                              planeMatrix[4], planeMatrix[5], planeMatrix[6], planeMatrix[7],
+                              planeMatrix[8], planeMatrix[9], planeMatrix[10], planeMatrix[11],
+                              planeMatrix[12] + plane.center.x, planeMatrix[13] + plane.center.y,
+                              planeMatrix[14] + plane.center.z, planeMatrix[15],
+                              (int)plane.identifier, plane.extent.x, plane.extent.z,
+                              plane.extent.x / 2, 0.0, plane.extent.z / 2, -plane.extent.x / 2,
+                              0.0, plane.extent.z / 2, -plane.extent.x / 2, 0.0,
+                              -plane.extent.z / 2, plane.extent.x / 2, 0.0, -plane.extent.z / 2];
+        planeStr = [planeStr stringByAppendingString:@","];
+        result = [result stringByAppendingString:planeStr];
+    }
+    // Remove the last coma if there is any string
+    if (result != nil) {
+        result = [result substringToIndex:result.length - 1];
+        result = [result stringByAppendingString:@"]"];
+    }
+    return result;
+}
+
+- (NSString *)getAnchorsString:(nonnull NSArray<ARAnchor *> *)anchors {
+    NSString *result = nil;
+    for (int i = 0; i < anchors.count; i++) {
+        if ([anchors[i] isKindOfClass:[ARPlaneAnchor class]] ||
+            [anchors[i] isKindOfClass:[ARFaceAnchor class]]) {
+            // We do not want Plane or Face anchors.
+            continue;
+        }
+        if (result == nil) {
+            result = @"[";
+        }
+        ARAnchor *anchor = (ARAnchor *)anchors[i];
+        matrix_float4x4 anchorTransform = anchor.transform;
+        const float *anchorMatrix = (const float *)(&anchorTransform);
+        NSString *jsAnchorId =
+        objCAnchorIdsToJSAnchorIds[anchor.identifier.UUIDString];
+        NSString *anchorStr = [NSString
+                               stringWithFormat:
+                               @"{\"modelMatrix\":[%f,%f,%f,%f,%f,%f,%f,%f,"
+                               @"%f,%f,%f,%f,%f,%f,%f,%f],"
+                               @"\"identifier\":%@}",
+                               anchorMatrix[0], anchorMatrix[1], anchorMatrix[2], anchorMatrix[3],
+                               anchorMatrix[4], anchorMatrix[5], anchorMatrix[6], anchorMatrix[7],
+                               anchorMatrix[8], anchorMatrix[9], anchorMatrix[10],
+                               anchorMatrix[11], anchorMatrix[12], anchorMatrix[13],
+                               anchorMatrix[14], anchorMatrix[15], jsAnchorId];
+        anchorStr = [anchorStr stringByAppendingString:@","];
+        result = [result stringByAppendingString:anchorStr];
+    }
+    // Remove the last coma if there is any string
+    if (result != nil) {
+        result = [result substringToIndex:result.length - 1];
+        result = [result stringByAppendingString:@"]"];
+    }
+    return result;
+}
+
+- (void)dispatchVRDisplayEvent:(NSString *)type
+                      dataName:(NSString *)dataName
+                    dataString:(NSString *)dataString {
+  
+    NSString *jsCode =
+    [NSString stringWithFormat:
+     @"if (window.WebARonARKitDispatchARDisplayEvent) "
+     @"window.WebARonARKitDispatchARDisplayEvent({"
+     @"\"type\":\"%@\","
+     @"\"%@\":%@"
+     @"});",
+     type, dataName, dataString];
+
+    [wkWebView
+     evaluateJavaScript:jsCode
+     completionHandler:^(id data, NSError *error) {
+         if (error) {
+             [self showAlertDialog:
+              [NSString stringWithFormat:@"ERROR: Evaluating jscode: %@",
+               error]
+                 completionHandler:^{
+                 }];
+         }
+     }];
+}
+
+- (void)session:(ARSession *)session
+  didAddAnchors:(nonnull NSArray<ARAnchor *> *)anchors {
+    NSString *planesString = [self getPlanesString:anchors];
+    if (planesString) {
+        [self dispatchVRDisplayEvent:@"planesadded"
+                            dataName:@"planes"
+                          dataString:planesString];
+    }
+}
+
+- (void)session:(ARSession *)session
+didUpdateAnchors:(nonnull NSArray<ARAnchor *> *)anchors {
+    // TODO(@ijamardo): Instead of iterating over the anchors collection several
+    // times for differnt types, merge them into one function.
+    NSString *planesString = [self getPlanesString:anchors];
+    if (planesString) {
+        [self dispatchVRDisplayEvent:@"planesupdated"
+                            dataName:@"planes"
+                          dataString:planesString];
+    }
+    NSString *anchorsString = [self getAnchorsString:anchors];
+    if (anchorsString) {
+        [self dispatchVRDisplayEvent:@"anchorsupdated"
+                            dataName:@"anchors"
+                          dataString:anchorsString];
+    }
+
+    // TODO: As we are not able to get an update on the anchors this code forces
+    // a call to the anchorsUpdated event dispatching for testing purposes.
+    //  if (anchorsString == nil && self->anchors.count > 0) {
+    //    anchorsString = [self getAnchorsString:self->anchors.allValues];
+    //    [self dispatchVRDisplayEvent:@"anchorsupdated"
+    //                        dataName:@"anchors" dataString:anchorsString];
+    //  }
+}
+
+- (void)session:(ARSession *)session
+didRemoveAnchors:(nonnull NSArray<ARAnchor *> *)anchors {
+    NSString *planesString = [self getPlanesString:anchors];
+    if (planesString) {
+        [self dispatchVRDisplayEvent:@"planesremoved"
+                            dataName:@"planes"
+                          dataString:planesString];
+    }
+}
+
+- (void)session:(ARSession *)session didUpdateFrame:(ARFrame *)frame {
+  //todo
+
+    // Do not send AR data until a camera frame has been rendered.
+    if (!sendARData) {
+        return;
+    }
+
+    // If the window size has changed, notify the JS side about it.
+    // This is a hack due to the WKWebView not handling the
+    // window.innerWidth/Height
+    // correctly in the window.onresize events.
+    // TODO: Remove this hack once the WKWebView has fixed the issue.
+
+    // Send the per frame data needed in the JS side
+    matrix_float4x4 viewMatrix =
+    [frame.camera viewMatrixForOrientation:interfaceOrientation];
+    matrix_float4x4 modelMatrix = matrix_invert(viewMatrix);
+    matrix_float4x4 projectionMatrix = [frame.camera
+                                        projectionMatrixForOrientation:interfaceOrientation
+                                        viewportSize:CGSizeMake(wkWebView.frame.size.width,
+                                                                wkWebView.frame.size.height)
+                                        zNear:near
+                                        zFar:far];
+
+    const float *pModelMatrix = (const float *)(&modelMatrix);
+    const float *pViewMatrix = (const float *)(&viewMatrix);
+    const float *pProjectionMatrix = (const float *)(&projectionMatrix);
+
+    simd_quatf orientationQuat = simd_quaternion(modelMatrix);
+    const float *pOrientationQuat = (const float *)(&orientationQuat);
+    float position[3];
+    position[0] = pModelMatrix[12];
+    position[1] = pModelMatrix[13];
+    position[2] = pModelMatrix[14];
+
+    // Get the camera frame in base 64.
+    NSString* base64ImageString = @"";
+    if (SEND_CAMERA_FRAME_TO_JS) {
+      base64ImageString = [self getBase64ImageFromPixelBuffer:
+          frame.capturedImage];
+      if (!base64ImageString) {
+        base64ImageString = @"";
+      } else {
+        base64ImageString = [NSString stringWithFormat:
+            @"data:image/jpg;base64, %@", base64ImageString];
+      }
+    }
+  
+    // Create a NSDictionary that will be parsed as a json and then passed to the JS side
+    NSDictionary* jsonDictionary = @{
+        @"position":
+            @[FBOX(position[0]), FBOX(position[1]), FBOX(position[2])],
+        @"orientation":
+            @[FBOX(pOrientationQuat[0]), FBOX(pOrientationQuat[1]),
+            FBOX(pOrientationQuat[2]), FBOX(pOrientationQuat[3])],
+        @"viewMatrix":
+            @[FBOX(pViewMatrix[0]), FBOX(pViewMatrix[1]),
+            FBOX(pViewMatrix[2]), FBOX(pViewMatrix[3]),
+            FBOX(pViewMatrix[4]), FBOX(pViewMatrix[5]),
+            FBOX(pViewMatrix[6]), FBOX(pViewMatrix[7]),
+            FBOX(pViewMatrix[8]), FBOX(pViewMatrix[9]),
+            FBOX(pViewMatrix[10]), FBOX(pViewMatrix[11]),
+            FBOX(pViewMatrix[12]), FBOX(pViewMatrix[13]),
+            FBOX(pViewMatrix[14]), FBOX(pViewMatrix[15])],
+        @"projectionMatrix":
+            @[FBOX(pProjectionMatrix[0]),
+            FBOX(pProjectionMatrix[1]),
+            FBOX(pProjectionMatrix[2]),
+            FBOX(pProjectionMatrix[3]),
+            FBOX(pProjectionMatrix[4]),
+            FBOX(pProjectionMatrix[5]),
+            FBOX(pProjectionMatrix[6]),
+            FBOX(pProjectionMatrix[7]),
+            FBOX(pProjectionMatrix[8]),
+            FBOX(pProjectionMatrix[9]),
+            FBOX(pProjectionMatrix[10]),
+            FBOX(pProjectionMatrix[11]),
+            FBOX(pProjectionMatrix[12]),
+            FBOX(pProjectionMatrix[13]),
+            FBOX(pProjectionMatrix[14]),
+            FBOX(pProjectionMatrix[15])]
+        ,@"cameraFrame":base64ImageString
+    };
+    // Pass the dictionary to JSON and back to a string.
+    NSError* error;
+    NSData* jsonData =
+        [NSJSONSerialization dataWithJSONObject:jsonDictionary
+        options:NSJSONWritingPrettyPrinted error:&error];
+    NSString* jsonString = [[NSString alloc] initWithData:jsonData
+        encoding:NSUTF8StringEncoding];
+  
+//    NSLog(@"jsonString = %@", jsonString);
+
+    // This will be the final JS code to evaluate
+    NSString* jsCode =
+        [NSString stringWithFormat:
+        @"if (window.WebARonARKitSetData) "
+        @"window.WebARonARKitSetData(%@)",
+        jsonString];
+
+    // Execute the JS code
+    [wkWebView
+     evaluateJavaScript:jsCode
+     completionHandler:^(id data, NSError *error) {
+       if (error) {
+         [self showAlertDialog:
+             [NSString stringWithFormat:@"ERROR: Evaluating jscode: %@", error]
+             completionHandler:^{ }];
+         }
+     }];
+
+    // This needs to be called after because the window size will affect the
+    // projection matrix calculation upon resize
+    if (updateWindowSize) {
+        int width = wkWebView.frame.size.width;
+        int height = wkWebView.frame.size.height;
+        NSString *updateWindowSizeJsCode =
+            [NSString stringWithFormat: @"if(window.WebARonARKitSetWindowSize)"
+            @"WebARonARKitSetWindowSize({\"width\":%i,\"height\":%i});",
+            width, height];
+        [wkWebView
+         evaluateJavaScript:updateWindowSizeJsCode
+         completionHandler:^(id data, NSError *error) {
+             if (error) {
+                 [self showAlertDialog:[NSString
+                                        stringWithFormat:@"ERROR: Evaluating "
+                                        @"jscode to provide "
+                                        @"window size: %@",
+                                        error]
+                     completionHandler:^{
+                     }];
+             }
+         }];
+        updateWindowSize = false;
+    }
+
+    sendARData = false;
+}
+
+#pragma mark - WKUIDelegate
+
+- (void)webView:(WKWebView *)webView
+runJavaScriptAlertPanelWithMessage:(NSString *)message
+initiatedByFrame:(WKFrameInfo *)frame
+completionHandler:(void (^)(void))completionHandler {
+    [self showAlertDialog:message completionHandler:completionHandler];
+}
+
+#pragma mark - ARSessionObserver
+
+- (void)session:(ARSession *)session
+cameraDidChangeTrackingState:(ARCamera *)camera {
+    NSString *trackingStateString = nil;
+    if (camera.trackingState == ARTrackingStateNotAvailable) {
+        trackingStateString = @"Not Available";
+    } else if (camera.trackingState == ARTrackingStateLimited) {
+        trackingStateString = @"Limited";
+    } else if (camera.trackingState == ARTrackingStateNormal) {
+        trackingStateString = @"Normal";
+    }
+    NSString *trackingStateReasonString = nil;
+    if (camera.trackingStateReason == ARTrackingStateReasonExcessiveMotion) {
+        trackingStateReasonString = @"Excessive Motion";
+    } else if (camera.trackingStateReason ==
+               ARTrackingStateReasonInsufficientFeatures) {
+        trackingStateReasonString = @"Insufficient Featues";
+    }
+    NSLog(@"AR camera tracking state = %@%@", trackingStateString,
+          (trackingStateReasonString != nil ? trackingStateReasonString : @""));
+}
+
+#pragma mark - WKScriptMessageHandler
+
+- (void)userContentController:(WKUserContentController *)userContentController
+      didReceiveScriptMessage:(WKScriptMessage *)message {
+    NSString *messageString = message.body;
+    NSArray *values = [messageString componentsSeparatedByString:@":"];
+    if ([values count] > 1) {
+        NSString *method = values[0];
+        NSArray *params = [values[1] componentsSeparatedByString:@","];
+        if ([method isEqualToString:@"setDepthNear"]) {
+            near = [params[0] floatValue];
+        } else if ([method isEqualToString:@"setDepthFar"]) {
+            far = [params[0] floatValue];
+        } else if ([method isEqualToString:@"log"]) {
+            // As a log command can have colons in its content, just get rid of the
+            // 'log:' string and show the rest.
+            NSRange range = NSMakeRange(4, messageString.length - 4);
+            NSLog(@"%@", [message.body substringWithRange:range]);
+        } else if ([method isEqualToString:@"resetPose"]) {
+            [self restartSession];
+        } else if ([method isEqualToString:@"showCameraFeed"]) {
+            [self setShowCameraFeed:true];
+        } else if ([method isEqualToString:@"hideCameraFeed"]) {
+            [self setShowCameraFeed:false];
+        } else if ([method isEqualToString:@"addAnchor"]) {
+            // Construct the ARAnchor with the matrix provided from the js side.
+            NSString *jsAnchorId = params[0];
+            matrix_float4x4 modelMatrix;
+            float *pModelMatrix = (float *)(&modelMatrix);
+            for (int i = 0; i < 16; i++) {
+                pModelMatrix[i] = [params[i + 1] floatValue];
+            }
+            ARAnchor *anchor = [[ARAnchor alloc] initWithTransform:modelMatrix];
+            [_session addAnchor:anchor];
+            // Create an entry to convert from the js id to the objective c id (and
+            // viceversa)
+            [jsAnchorIdsToObjCAnchorIds setValue:anchor.identifier.UUIDString
+                                          forKey:jsAnchorId];
+            [objCAnchorIdsToJSAnchorIds setValue:jsAnchorId
+                                          forKey:anchor.identifier.UUIDString];
+            // Store the anchor
+            [anchors setValue:anchor forKey:jsAnchorId];
+        } else if ([method isEqualToString:@"removeAnchor"]) {
+            // Retrive the ARAnchor from the jsAnchorId and remove it from the
+            // session. Of course, also remove all the id mapping and the anchor
+            // from the anchors container.
+            NSString *jsAnchorId = params[0];
+            ARAnchor *anchor = anchors[jsAnchorId];
+            NSString *objCAnchorId = anchor.identifier.UUIDString;
+            [jsAnchorIdsToObjCAnchorIds removeObjectForKey:jsAnchorId];
+            [objCAnchorIdsToJSAnchorIds removeObjectForKey:objCAnchorId];
+            [anchors removeObjectForKey:jsAnchorId];
+
+            [_session removeAnchor:anchor];
+        } else if ([method isEqualToString:@"advanceFrame"]) {
+            // The JS side stated that the AR data was used so we can render
+            // a new camera frame now.
+            drawNextCameraFrame = true;
+        } else {
+            NSLog(@"WARNING: Unknown message received: '%@'", method);
+        }
+    }
+}
+
+/*
+ This code is inspired by the open source project:
+ https://github.com/Stinkstudios/arkit-web
+ Kudos to: Amelie (@ixviii_io)
+ */
+-(NSString*)getBase64ImageFromPixelBuffer:(CVPixelBufferRef)pixelBuffer {
+  // The context to be able to create the CGImage.
+  static CIContext* ciContext = nil;
+  ciContext = [CIContext contextWithOptions:nil];
+  // Convert the pixel buffer to a CIImage
+  CIImage* ciImage = [CIImage imageWithCVPixelBuffer:pixelBuffer];
+  // Apply a scaling transformation to the CIImage and get a new one
+  CGAffineTransform scaleTransform =
+  CGAffineTransformScale(CGAffineTransformIdentity,
+      CAMERA_FRAME_SCALE_FACTOR, CAMERA_FRAME_SCALE_FACTOR);
+  CIImage* resizedCIImage = [ciImage imageByApplyingTransform:scaleTransform];
+  // Create a CGImage from the CIImage
+  CGImageRef cgImage = [ciContext createCGImage:resizedCIImage
+      fromRect:resizedCIImage.extent];
+  if (cgImage) {
+    // Create an UIImage from the CGImage
+    UIImage* uiImage = [UIImage imageWithCGImage:cgImage];
+    // IMPORTANT: CG structures are not handled by the ARC system.
+    // Release the CG image now that we have a corresponding UIImage.
+    CGImageRelease(cgImage);
+    // Compress the image as JPEG
+    NSData* jpegImageData =
+        UIImageJPEGRepresentation(uiImage, CAMERA_FRAME_JPEG_COMPRESSION_FACTOR);
+    if (jpegImageData) {
+      // Transform the JPEG data into a base64 format so it can be
+      // passed to the JS side as a string.
+      return [jpegImageData base64EncodedStringWithOptions:
+          NSDataBase64Encoding64CharacterLineLength];
+    }
+  }
+  return nil;
+}
+
+@end
