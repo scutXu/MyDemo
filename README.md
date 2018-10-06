@@ -2,7 +2,9 @@
 
 A naive demo aims to prove the ablity of a C++ graphic programer mastering front end development.
 
-![GIF Preview](https://github.com/xu-xionglong/MyDemo/blob/master/ezgif-4-2731c3a75f68.gif)
+Please be patient until the gif is loaded.
+
+![](https://github.com/xu-xionglong/MyDemo/blob/master/ezgif-4-2731c3a75f68.gif)
 
 
 ## Dependency
