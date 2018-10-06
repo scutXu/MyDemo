@@ -55,18 +55,18 @@ see [github issue](https://github.com/facebook/react-native/issues/19774)
 ---
 
 
-###error
+### error
 ```
 Build input file cannot be found: 'MyDemo/node_modules/react-native/Libraries/WebSocket/libfishhook.a'
 ```
 
-###solution
+### solution
 
 [see solution from jianshu](https://www.jianshu.com/p/3e29e9d897c8)
 
 -----
 
-###error
+### error
 
 ```
 Undefined symbols for architecture arm64:
@@ -78,6 +78,6 @@ ld: symbol(s) not found for architecture arm64
 clang: error: linker command failed with exit code 1 (use -v to see invocation)
 ```
 
-###solution
+### solution
 
 这个问题没有在网上找到解决方法，我用第二个问题的解决办法解决的。在项目的依赖项里面先移除一次libRCTWebSocket.a，再添加回去。
